@@ -8,6 +8,7 @@ description: >-
   the other agent blind, then reconciles both reviews into one merged report.
   Use when the user says "second opinion", "what does codex think", "what does
   claude think", "cross-check this", or wants independent eyes before merging.
+license: MIT
 ---
 
 # Second Opinion Protocol

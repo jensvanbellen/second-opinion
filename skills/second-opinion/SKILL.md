@@ -46,6 +46,12 @@ First match wins:
    that is the subject.
 4. Nothing found → ask the user what needs a second opinion, and stop.
 
+Then classify the subject as **code** (a repo, PR, branch diff, or files) or
+**non-code** (a document, a message draft, or free-form prose the user pasted).
+This choice drives the command form in step 5 and the output format in step 4:
+a non-code subject has no `file:line` and no git diff, so embed the text in the
+brief and ask for a critique rather than a rewrite.
+
 ## 3. Pre-fetch external context
 
 The counterpart runs sandboxed: repo files only, no network, no access to this
@@ -72,32 +78,52 @@ session, so the brief must stand alone:
   cases — or the user's explicit question. Default when unspecified: "thorough
   review of this change; prioritize real problems over style".
 - **Output format:** numbered findings, each with a severity
-  (blocker / major / minor / nit), `file:line`, and reasoning — followed by a
-  short overall verdict. Say explicitly: "if you find nothing significant, say
-  so plainly rather than inventing issues".
+  (blocker / major / minor / nit), a location (`file:line` for code; where
+  applicable otherwise), and reasoning — followed by a short overall verdict.
+  Say explicitly: "if you find nothing significant, say so plainly rather than
+  inventing issues". For a non-code subject (a document, message, or prose),
+  ask for a critique with concrete findings, not a rewrite of the material.
 
-**Do not include your own findings, hypotheses, or draft review.** A blind
+**The counterpart is the sole reviewer — say so, and keep trigger phrases out of
+the brief.** The counterpart very likely has this same skill installed. If the
+brief contains "second opinion", "counterpart", or "blind review", it re-triggers
+the protocol and tries to delegate to *another* agent (`claude -p`, a sub-agent),
+which then fails on auth or the read-only sandbox and leaves the output file
+holding only an apology instead of a review. So: call it "a code review request",
+and state plainly that it must review directly and must not run any skill,
+workflow, or agent/CLI (no `claude`, no `codex`, no sub-agents, no "second
+opinion" process) — it is the only reviewer.
+
+**Do not include your own findings, hypotheses, or draft review.** An independent
 review is the whole point — anchoring the counterpart on your conclusions
 destroys the value of the second opinion. Only pass along something the user
 explicitly asked you to relay.
 
 ## 5. Invoke the counterpart
 
-Run it read-only, from the repo root, and be patient: multi-minute runs are
-normal and acceptable. Use a generous timeout (10 minutes); if it may need
-longer, run it in the background and poll.
+Run it read-only and **always in the background** — never in the foreground. A
+substantial diff review routinely takes 5-20 minutes; a foreground run is killed
+at the harness 10-minute wall (`Exit code 143`), and because codex writes `-o`
+only at the very end, the whole run is lost with an empty output file. Launch it
+detached to output and log paths you control, then poll every 30-60s until it
+exits.
 
 **From Claude Code (counterpart = Codex):**
 
 ```bash
-BRIEF=$(mktemp) OUT=$(mktemp)   # write the brief into $BRIEF first
-codex exec --sandbox read-only -C "$(git rev-parse --show-toplevel)" \
-  -o "$OUT" - < "$BRIEF"
+# $BRIEF already written. Own the paths so polling targets them directly.
+OUT=$(mktemp) LOG=$(mktemp)
+REPO=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+nohup codex exec --sandbox read-only --skip-git-repo-check -C "$REPO" \
+  -o "$OUT" - < "$BRIEF" > "$LOG" 2>&1 &
 ```
 
-The final review lands in `$OUT`; stdout is just the progress log. (If your own
-shell sandbox blocks codex's API access, rerun the command unsandboxed — codex
-still enforces its own read-only sandbox on the repo.)
+`--skip-git-repo-check` is required: without it codex refuses with *"Not inside a
+trusted directory"* whenever `-C` is not a checked-out repo (a scratchpad, a doc,
+a pasted message). For a non-code subject, point `-C` at the directory holding
+the material (or `pwd`) and embed the text itself in the brief. (If your own
+shell sandbox blocks codex's API access, rerun unsandboxed — codex still enforces
+its own read-only sandbox on the repo.)
 
 **From Codex (counterpart = Claude Code):**
 
@@ -106,9 +132,16 @@ claude -p --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(g
   < "$BRIEF" > "$OUT"
 ```
 
-If the invocation fails (auth, network, missing binary), report the error to
-the user verbatim and stop. Never fabricate or paraphrase a second opinion that
-did not actually run.
+**Verify the output before trusting it.** `-o` captures only codex's *last*
+message, which is the review only on a clean run. After it exits, confirm `$OUT`
+is non-empty and actually reads like a review (numbered findings / a verdict) —
+not an auth or delegation apology ("couldn't complete the second-opinion
+workflow", "Not logged in"), and not a rewrite of the material. If it is empty or
+an apology: inspect `$LOG`; if codex tried to delegate to another agent, rerun
+with the sole-reviewer brief from step 4. If the invocation itself failed (auth,
+network, missing binary) or produced nothing usable, report the error to the user
+verbatim and stop. Never fabricate or paraphrase a second opinion that did not
+actually run.
 
 ## 6. Reconcile — do not just relay
 

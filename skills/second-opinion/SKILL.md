@@ -101,21 +101,60 @@ explicitly asked you to relay.
 
 ## 5. Invoke the counterpart
 
+**Smoke-test the counterpart before the full review.** Codex can hang on startup
+with zero output and 0% CPU (a stale in-progress update, a macOS
+permission/Gatekeeper prompt, or a hanging codex MCP server can all cause it). A
+hung process never writes `$OUT` and never exits, so the poll loop below would
+wait forever. Catch it first with a fast liveness check under a short (~15s)
+watchdog. GNU `timeout` is **not** installed on macOS by default (`command not
+found`, exit 127), so use a portable shell watchdog — background the process,
+keep its pid, poll `kill -0`, `kill -9` on the deadline — or `gtimeout` if
+coreutils is installed, never a bare `timeout`. Redirect `</dev/null` so a
+non-prompt check cannot block on an inherited pipe stdin:
+
+```bash
+# Claude Code side: liveness of codex. From Codex, use `claude --version` instead.
+codex --version </dev/null >/dev/null 2>&1 &
+p=$!
+for _ in $(seq 15); do kill -0 "$p" 2>/dev/null || break; sleep 1; done
+if kill -0 "$p" 2>/dev/null; then kill -9 "$p" 2>/dev/null; startup_hang=1; fi
+```
+
+If the check does not return within the watchdog, the binary is hanging on
+startup: do **not** launch the 5-20 min review. Tell the user the counterpart is
+hanging on startup and how to fix it (reinstall, clear a stale in-progress
+update, or answer a pending macOS permission/Gatekeeper prompt), then stop.
+
 Run it read-only and **always in the background** — never in the foreground. A
 substantial diff review routinely takes 5-20 minutes; a foreground run is killed
 at the harness 10-minute wall (`Exit code 143`), and because codex writes `-o`
 only at the very end, the whole run is lost with an empty output file. Launch it
-detached to output and log paths you control, then poll every 30-60s until it
-exits.
+detached to output and log paths you control, then poll it on a guarded loop —
+one that also trips on a startup hang and enforces a hard wall-clock cap, so it
+never spins forever.
 
 **From Claude Code (counterpart = Codex):**
 
 ```bash
 # $BRIEF already written. Own the paths so polling targets them directly.
-OUT=$(mktemp) LOG=$(mktemp)
+OUT=$(mktemp) LOG=$(mktemp) marker=$(mktemp)   # marker = "session files after launch"
 REPO=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 nohup codex exec --sandbox read-only --skip-git-repo-check -C "$REPO" \
   -o "$OUT" - < "$BRIEF" > "$LOG" 2>&1 &
+pid=$! start=$(date +%s)
+
+# Poll ~every 30s. Two guards keep this from spinning forever:
+while kill -0 "$pid" 2>/dev/null; do
+  elapsed=$(( $(date +%s) - start ))
+  # Startup hang: no log output AND no new session file within ~90s -> kill.
+  if [ "$elapsed" -ge 90 ] && [ ! -s "$LOG" ] && \
+     [ -z "$(find ~/.codex/sessions -name 'rollout-*.jsonl' -newer "$marker" 2>/dev/null)" ]; then
+    kill -9 "$pid" 2>/dev/null; startup_hang=1; break
+  fi
+  # Hard wall-clock cap (~25 min) -> kill regardless.
+  if [ "$elapsed" -ge 1500 ]; then kill -9 "$pid" 2>/dev/null; timed_out=1; break; fi
+  sleep 30
+done
 ```
 
 `--skip-git-repo-check` is required: without it codex refuses with *"Not inside a
@@ -138,8 +177,22 @@ is non-empty and actually reads like a review (numbered findings / a verdict) �
 not an auth or delegation apology ("couldn't complete the second-opinion
 workflow", "Not logged in"), and not a rewrite of the material. If it is empty or
 an apology: inspect `$LOG`; if codex tried to delegate to another agent, rerun
-with the sole-reviewer brief from step 4. If the invocation itself failed (auth,
-network, missing binary) or produced nothing usable, report the error to the user
+with the sole-reviewer brief from step 4.
+
+**Recover a review lost to a hang or kill.** `-o` writes only codex's final
+message, and only at the very end, so a hang or a killed run (`startup_hang` /
+`timed_out` above) leaves `$OUT` empty even though the work happened. The session
+transcript still holds it: read the last `task_complete` event's
+`last_agent_message` from the newest session file before giving up.
+
+```bash
+sess=$(find ~/.codex/sessions -name 'rollout-*.jsonl' 2>/dev/null | xargs ls -t 2>/dev/null | head -1)
+recovered=$(jq -r 'select(.payload.type=="task_complete") | .payload.last_agent_message' "$sess" 2>/dev/null | tail -1)
+[ -z "$recovered" ] && recovered=$(jq -r '.. | .last_agent_message? // empty' "$sess" 2>/dev/null | tail -1)
+```
+
+If nothing usable can be recovered — the invocation failed on auth, network, or a
+missing binary, or the transcript holds no review — report the error to the user
 verbatim and stop. Never fabricate or paraphrase a second opinion that did not
 actually run.
 

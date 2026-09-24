@@ -130,8 +130,15 @@ substantial diff review routinely takes 5-20 minutes; a foreground run is killed
 at the harness 10-minute wall (`Exit code 143`), and because codex writes `-o`
 only at the very end, the whole run is lost with an empty output file. Launch it
 detached to output and log paths you control, then poll it on a guarded loop —
-one that also trips on a startup hang and enforces a hard wall-clock cap, so it
-never spins forever.
+one that trips on a startup hang, a stall, and a runaway ceiling, so it never
+spins forever.
+
+**Run the launch-plus-poll block itself as a background job** (your harness's
+`run_in_background`, or a detached `setsid`/`&` script), never as one blocking
+foreground call. The poll loop below runs for as long as the review does, so a
+foreground invocation of it hits the very 10-minute wall described above and the
+monitor dies before its own guards fire. It also writes the kill reason to a
+file, so a later step in a fresh shell can still report why the run ended.
 
 **From Claude Code (counterpart = Codex):**
 
@@ -142,13 +149,16 @@ REPO=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 nohup codex exec --sandbox read-only --skip-git-repo-check -C "$REPO" \
   -o "$OUT" - < "$BRIEF" > "$LOG" 2>&1 &
 pid=$! start=$(date +%s)
-last_size=0 last_change=$start
+last_size=0 last_change=$start reason=running
 
 # Poll ~every 30s. Guards keep this from spinning forever WITHOUT killing a
 # slow-but-working review: codex streams progress to $LOG, so a growing log
 # means it is alive. Kill only on a startup hang, a stall (no log growth for
 # STALL_SECS), or a runaway (absolute CEIL_SECS backstop) — never on total
 # elapsed alone, since a large diff can legitimately run past any fixed cap.
+# STALL_SECS is a heuristic: a genuinely silent model turn can trip it and a
+# process that emits periodic noise can dodge it, so tune it to your reviews;
+# CEIL_SECS is only the last-resort backstop against an infinite wait.
 STALL_SECS=420 CEIL_SECS=3600
 while kill -0 "$pid" 2>/dev/null; do
   now=$(date +%s) elapsed=$(( now - start ))
@@ -157,18 +167,28 @@ while kill -0 "$pid" 2>/dev/null; do
   # Startup hang: no log output AND no new session file within ~90s -> kill.
   if [ "$elapsed" -ge 90 ] && [ ! -s "$LOG" ] && \
      [ -z "$(find ~/.codex/sessions -name 'rollout-*.jsonl' -newer "$marker" 2>/dev/null)" ]; then
-    kill -9 "$pid" 2>/dev/null; startup_hang=1; break
+    reason=startup_hang; kill -9 "$pid" 2>/dev/null; break
   fi
-  # Stall: log started, then stopped growing for STALL_SECS -> kill.
-  if [ "$last_size" -gt 0 ] && [ $(( now - last_change )) -ge "$STALL_SECS" ]; then
-    kill -9 "$pid" 2>/dev/null; stalled=1; break
+  # Stall: no log growth for STALL_SECS past the 90s startup grace. No
+  # `last_size > 0` guard, so a process that opens a transcript then goes silent
+  # without ever writing $LOG is caught here too (not left to the ceiling).
+  if [ "$elapsed" -ge 90 ] && [ $(( now - last_change )) -ge "$STALL_SECS" ]; then
+    reason=stalled; kill -9 "$pid" 2>/dev/null; break
   fi
   # Runaway backstop only — not a normal-run deadline. Raise if your reviews
   # legitimately run longer; a live review keeps resetting the stall timer.
-  if [ "$elapsed" -ge "$CEIL_SECS" ]; then kill -9 "$pid" 2>/dev/null; timed_out=1; break; fi
+  if [ "$elapsed" -ge "$CEIL_SECS" ]; then reason=timed_out; kill -9 "$pid" 2>/dev/null; break; fi
   sleep 30
 done
+[ "$reason" = running ] && reason=exited
+printf '%s\n' "$reason" > "$OUT.reason"   # readable by a later step in a fresh shell
 ```
+
+After the loop, `$OUT.reason` is one of `exited` (codex returned on its own),
+`startup_hang`, `stalled`, or `timed_out`. Branch on it: `exited` -> trust `$OUT`
+(still verify it below); the three kill reasons -> attempt the recovery below,
+and if that yields nothing, tell the user the run was killed and why (name the
+reason) rather than reporting an empty review as "no findings".
 
 `--skip-git-repo-check` is required: without it codex refuses with *"Not inside a
 trusted directory"* whenever `-C` is not a checked-out repo (a scratchpad, a doc,
@@ -177,11 +197,20 @@ the material (or `pwd`) and embed the text itself in the brief. (If your own
 shell sandbox blocks codex's API access, rerun unsandboxed — codex still enforces
 its own read-only sandbox on the repo.)
 
-**From Codex (counterpart = Claude Code):**
+**From Codex (counterpart = Claude Code):** this path needs the same protections
+as the codex path above — it too can hang or run long. Initialize its own paths
+(do not rely on the codex block's `$OUT`/`$LOG`), launch it detached, and poll it
+with the identical guarded loop (startup-hang / stall / ceiling, `$OUT.reason`),
+also as a background job.
 
 ```bash
-claude -p --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git branch:*),Bash(git merge-base:*)" \
-  < "$BRIEF" > "$OUT"
+OUT=$(mktemp) LOG=$(mktemp) start=$(date +%s) last_size=0 last_change=$start reason=running
+nohup claude -p --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git branch:*),Bash(git merge-base:*)" \
+  < "$BRIEF" > "$OUT" 2> "$LOG" &
+pid=$!
+# then the SAME poll loop as the codex path, watching $LOG for growth. claude
+# streams its answer to $OUT, so there is no separate transcript to recover from:
+# on a stall/ceiling kill, whatever is already in $OUT is the partial review.
 ```
 
 **Verify the output before trusting it.** `-o` captures only codex's *last*
@@ -192,16 +221,23 @@ workflow", "Not logged in"), and not a rewrite of the material. If it is empty o
 an apology: inspect `$LOG`; if codex tried to delegate to another agent, rerun
 with the sole-reviewer brief from step 4.
 
-**Recover a review lost to a hang or kill.** `-o` writes only codex's final
-message, and only at the very end, so a hang or a killed run (`startup_hang` /
-`timed_out` above) leaves `$OUT` empty even though the work happened. The session
-transcript still holds it: read the last `task_complete` event's
-`last_agent_message` from the newest session file before giving up.
+**Recover a review lost to a hang or kill (codex path).** `-o` writes only
+codex's final message, and only at the very end, so any kill reason
+(`startup_hang` / `stalled` / `timed_out`) leaves `$OUT` empty even though the
+work happened. The session transcript still holds it. Two rules matter: pick the
+transcript from **this** launch (newer than `$marker`), not the globally newest —
+otherwise you can recover a stale prior run or a concurrent codex process — and
+extract the message **whole**, not line-oriented (`tail -1` would keep only the
+last physical line of a multiline review and silently drop every finding).
 
 ```bash
-sess=$(find ~/.codex/sessions -name 'rollout-*.jsonl' 2>/dev/null | xargs ls -t 2>/dev/null | head -1)
-recovered=$(jq -r 'select(.payload.type=="task_complete") | .payload.last_agent_message' "$sess" 2>/dev/null | tail -1)
-[ -z "$recovered" ] && recovered=$(jq -r '.. | .last_agent_message? // empty' "$sess" 2>/dev/null | tail -1)
+# Newest transcript from THIS launch only; -print0/-0 is whitespace-safe and
+# picks the single newest file (plain `find | xargs ls` can split into batches).
+sess=$(find ~/.codex/sessions -name 'rollout-*.jsonl' -newer "$marker" -print0 2>/dev/null \
+  | xargs -0 ls -t 2>/dev/null | head -1)
+# Slurp the JSONL (-s) and take the LAST task_complete message as one whole value.
+recovered=$(jq -rs 'map(select(.payload.type=="task_complete")) | last | .payload.last_agent_message // empty' "$sess" 2>/dev/null)
+[ -z "$recovered" ] && recovered=$(jq -rs '[.[] | .. | objects | .last_agent_message? // empty] | last // empty' "$sess" 2>/dev/null)
 ```
 
 If nothing usable can be recovered — the invocation failed on auth, network, or a

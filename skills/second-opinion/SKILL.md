@@ -142,17 +142,30 @@ REPO=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 nohup codex exec --sandbox read-only --skip-git-repo-check -C "$REPO" \
   -o "$OUT" - < "$BRIEF" > "$LOG" 2>&1 &
 pid=$! start=$(date +%s)
+last_size=0 last_change=$start
 
-# Poll ~every 30s. Two guards keep this from spinning forever:
+# Poll ~every 30s. Guards keep this from spinning forever WITHOUT killing a
+# slow-but-working review: codex streams progress to $LOG, so a growing log
+# means it is alive. Kill only on a startup hang, a stall (no log growth for
+# STALL_SECS), or a runaway (absolute CEIL_SECS backstop) — never on total
+# elapsed alone, since a large diff can legitimately run past any fixed cap.
+STALL_SECS=420 CEIL_SECS=3600
 while kill -0 "$pid" 2>/dev/null; do
-  elapsed=$(( $(date +%s) - start ))
+  now=$(date +%s) elapsed=$(( now - start ))
+  size=$(wc -c < "$LOG" 2>/dev/null || echo 0)
+  [ "$size" -gt "$last_size" ] && { last_size=$size; last_change=$now; }
   # Startup hang: no log output AND no new session file within ~90s -> kill.
   if [ "$elapsed" -ge 90 ] && [ ! -s "$LOG" ] && \
      [ -z "$(find ~/.codex/sessions -name 'rollout-*.jsonl' -newer "$marker" 2>/dev/null)" ]; then
     kill -9 "$pid" 2>/dev/null; startup_hang=1; break
   fi
-  # Hard wall-clock cap (~25 min) -> kill regardless.
-  if [ "$elapsed" -ge 1500 ]; then kill -9 "$pid" 2>/dev/null; timed_out=1; break; fi
+  # Stall: log started, then stopped growing for STALL_SECS -> kill.
+  if [ "$last_size" -gt 0 ] && [ $(( now - last_change )) -ge "$STALL_SECS" ]; then
+    kill -9 "$pid" 2>/dev/null; stalled=1; break
+  fi
+  # Runaway backstop only — not a normal-run deadline. Raise if your reviews
+  # legitimately run longer; a live review keeps resetting the stall timer.
+  if [ "$elapsed" -ge "$CEIL_SECS" ]; then kill -9 "$pid" 2>/dev/null; timed_out=1; break; fi
   sleep 30
 done
 ```

@@ -117,13 +117,45 @@ non-prompt check cannot block on an inherited pipe stdin:
 codex --version </dev/null >/dev/null 2>&1 &
 p=$!
 for _ in $(seq 15); do kill -0 "$p" 2>/dev/null || break; sleep 1; done
-if kill -0 "$p" 2>/dev/null; then kill -9 "$p" 2>/dev/null; startup_hang=1; fi
+if kill -0 "$p" 2>/dev/null; then kill -9 "$p" 2>/dev/null; echo startup_hang; fi
 ```
 
-If the check does not return within the watchdog, the binary is hanging on
-startup: do **not** launch the 5-20 min review. Tell the user the counterpart is
-hanging on startup and how to fix it (reinstall, clear a stale in-progress
-update, or answer a pending macOS permission/Gatekeeper prompt), then stop.
+**Then prove codex can run a command.** A passing `--version` is not enough.
+`codex exec` runs shell commands through a separate helper binary
+(`codex-code-mode-host`). When that helper is blocked, typically by its own
+pending Gatekeeper prompt after an update, codex starts normally but every
+command fails with `timed out negotiating with the code-mode host`. The review
+then comes back empty, or answered from guesswork. Ask it for a nonce it can only
+know by running a command (a value like `pwd` can be guessed from the session
+header):
+
+```bash
+nonce_dir=$(mktemp -d) nonce="$RANDOM$RANDOM$RANDOM"
+echo "$nonce" > "$nonce_dir/nonce"
+printf 'Run `cat %s/nonce` and reply with only its output. Do not run any skill or other agent.\n' "$nonce_dir" \
+  | codex exec --sandbox read-only --skip-git-repo-check -C "$nonce_dir" -o "$nonce_dir/out" - >/dev/null 2>&1 &
+p=$!
+for _ in $(seq 120); do kill -0 "$p" 2>/dev/null || break; sleep 1; done
+kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null
+grep -q "$nonce" "$nonce_dir/out" 2>/dev/null || echo command_tool_broken
+```
+
+If either check prints its marker, do **not** launch the 5-20 min review. Tell
+the user which check failed and how to fix it, then stop:
+
+- `startup_hang`: reinstall, clear a stale in-progress update, or answer a
+  pending macOS permission/Gatekeeper prompt.
+- `command_tool_broken`: usually a Gatekeeper prompt for `codex-code-mode-host`
+  still waiting on the Mac's screen. Answer it there, over Screen Sharing if the
+  machine is remote. `log show --last 15m --style compact --predicate 'process
+  == "syspolicyd" AND eventMessage CONTAINS "Prompt shown"'` names the binary
+  that is waiting.
+
+Homebrew quarantines every cask download, and a binary cask such as `codex`
+does not carry the user's approval across upgrades, so a Homebrew-installed
+Codex raises these prompts again after every update. OpenAI's standalone
+installer (`curl -fsSL https://chatgpt.com/codex/install.sh | sh`) downloads
+with curl, which sets no quarantine flag, so it avoids them.
 
 Run it read-only and **always in the background** — never in the foreground. A
 substantial diff review routinely takes 5-20 minutes; a foreground run is killed
